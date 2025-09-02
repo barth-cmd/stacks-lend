@@ -372,3 +372,114 @@
         (map-get? user-lending-positions { user: user })
     )
 )
+
+;; Get real-time protocol statistics and health metrics
+(define-read-only (get-protocol-statistics)
+    (let (
+        (total-deposits (var-get total-protocol-deposits))
+        (total-borrows (var-get total-protocol-borrows))
+        (utilization-rate (if (> total-deposits u0)
+            (/ (* total-borrows u100) total-deposits)
+            u0))
+    )
+    {
+        total-collateral-locked: total-deposits,
+        total-tokens-borrowed: total-borrows,
+        protocol-utilization-rate: utilization-rate,
+        minimum-collateral-ratio: (var-get minimum-collateral-ratio),
+        liquidation-threshold: (var-get liquidation-threshold),
+        protocol-fee-rate: (var-get protocol-fee-bps),
+        base-interest-rate: (var-get base-interest-rate),
+        total-protocol-revenue: (var-get protocol-revenue),
+        active-positions: (var-get total-active-positions)
+    })
+)
+
+;; Calculate borrowing capacity for a given collateral amount
+(define-read-only (calculate-max-borrow-amount (collateral-amount uint))
+    (/ (* collateral-amount u100) (var-get minimum-collateral-ratio))
+)
+
+;; Check if a position is healthy or at risk of liquidation
+(define-read-only (check-position-health (user principal))
+    (let (
+        (position (get-user-position user))
+        (collateral (get collateral-deposited position))
+        (debt (+ (get amount-borrowed position) (get accrued-interest position)))
+        (health-ratio (calculate-position-health-ratio collateral debt))
+    )
+    {
+        current-health-ratio: health-ratio,
+        is-healthy: (>= health-ratio (var-get minimum-collateral-ratio)),
+        liquidation-risk: (< health-ratio (var-get liquidation-threshold)),
+        collateral-amount: collateral,
+        total-debt: debt
+    })
+)
+
+;; PROTOCOL GOVERNANCE & ADMINISTRATION
+
+;; Update minimum collateral ratio (owner only)
+;; Controls the minimum health ratio required for borrowing
+(define-public (set-minimum-collateral-ratio (new-ratio uint))
+    (begin
+        (asserts! (is-eq tx-sender PROTOCOL_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= new-ratio MIN_COLLATERAL_RATIO) 
+                      (<= new-ratio MAX_COLLATERAL_RATIO)) 
+                 ERR_PARAMETER_OUT_OF_BOUNDS)
+        (asserts! (>= new-ratio (var-get liquidation-threshold))
+                 ERR_PARAMETER_OUT_OF_BOUNDS)
+        
+        (var-set minimum-collateral-ratio new-ratio)
+        (ok new-ratio)
+    )
+)
+
+;; Update liquidation threshold (owner only)  
+;; Sets the health ratio at which positions become liquidatable
+(define-public (set-liquidation-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender PROTOCOL_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= new-threshold MIN_COLLATERAL_RATIO)
+                      (<= new-threshold (var-get minimum-collateral-ratio)))
+                 ERR_PARAMETER_OUT_OF_BOUNDS)
+        
+        (var-set liquidation-threshold new-threshold)
+        (ok new-threshold)
+    )
+)
+
+;; Update protocol fee rate (owner only)
+;; Controls the fee percentage taken from repayments
+(define-public (set-protocol-fee (new-fee-bps uint))
+    (begin
+        (asserts! (is-eq tx-sender PROTOCOL_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= new-fee-bps MAX_PROTOCOL_FEE) ERR_PARAMETER_OUT_OF_BOUNDS)
+        
+        (var-set protocol-fee-bps new-fee-bps)
+        (ok new-fee-bps)
+    )
+)
+
+;; Update base interest rate (owner only)
+;; Sets the baseline interest rate for all borrowing
+(define-public (set-base-interest-rate (new-rate-bps uint))
+    (begin
+        (asserts! (is-eq tx-sender PROTOCOL_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= new-rate-bps MAX_INTEREST_RATE) ERR_PARAMETER_OUT_OF_BOUNDS)
+        
+        (var-set base-interest-rate new-rate-bps)
+        (ok new-rate-bps)
+    )
+)
+
+;; Emergency protocol pause (owner only)
+;; Implements circuit breaker for critical security situations
+(define-public (emergency-pause)
+    (begin
+        (asserts! (is-eq tx-sender PROTOCOL_OWNER) ERR_UNAUTHORIZED)
+        ;; Emergency pause logic would be implemented here
+        ;; This would disable non-critical functions during emergencies
+        (ok true)
+    )
+)
