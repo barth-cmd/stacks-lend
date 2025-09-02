@@ -117,3 +117,132 @@
     (< (calculate-position-health-ratio collateral-amount debt-amount)
        (var-get liquidation-threshold))
 )
+
+;; Calculate liquidation penalty and rewards
+;; Provides incentive for liquidators while protecting protocol
+(define-private (calculate-liquidation-amounts 
+    (collateral-amount uint) 
+    (debt-amount uint))
+    (let (
+        ;; 5% liquidation penalty applied to collateral
+        (penalty-rate u500)  ;; 5.00% in basis points
+        (liquidation-penalty (/ (* collateral-amount penalty-rate) BASIS_POINTS))
+        (liquidator-reward (/ liquidation-penalty u2))  ;; 50% of penalty to liquidator
+        (protocol-reward (- liquidation-penalty liquidator-reward))
+    )
+    {
+        liquidator-reward: liquidator-reward,
+        protocol-reward: protocol-reward,
+        collateral-to-seize: collateral-amount
+    })
+)
+
+;; POSITION MANAGEMENT UTILITIES
+
+;; Update user position with new collateral and debt amounts
+;; Handles interest accrual and health score recalculation
+(define-private (update-user-position 
+    (user principal) 
+    (new-collateral uint) 
+    (new-debt uint)
+    (accrue-interest bool))
+    (let (
+        (current-position (default-to
+            {
+                collateral-deposited: u0,
+                amount-borrowed: u0,
+                interest-rate-bps: (var-get base-interest-rate),
+                last-interaction-height: stacks-block-height,
+                accrued-interest: u0,
+                position-health-score: u0
+            }
+            (map-get? user-lending-positions { user: user })))
+        
+        ;; Calculate accrued interest if requested
+        (blocks-since-update (- stacks-block-height (get last-interaction-height current-position)))
+        (new-interest (if accrue-interest
+            (+ (get accrued-interest current-position)
+               (calculate-compound-interest 
+                   (get amount-borrowed current-position)
+                   (get interest-rate-bps current-position)
+                   blocks-since-update))
+            (get accrued-interest current-position)))
+        
+        ;; Calculate new health score
+        (total-debt (+ new-debt new-interest))
+        (health-score (calculate-position-health-ratio new-collateral total-debt))
+    )
+    
+    ;; Update position mapping and return true
+    (begin
+        (map-set user-lending-positions
+            { user: user }
+            {
+                collateral-deposited: new-collateral,
+                amount-borrowed: new-debt,
+                interest-rate-bps: (get interest-rate-bps current-position),
+                last-interaction-height: stacks-block-height,
+                accrued-interest: new-interest,
+                position-health-score: health-score
+            })
+        true))
+)
+
+;; CORE LENDING PROTOCOL FUNCTIONS
+
+;; DEPOSIT COLLATERAL
+;; Users deposit STX tokens as collateral to secure future borrowing capacity
+;; Collateral is safely held in the contract and tracked per user
+(define-public (deposit-collateral (amount uint))
+    (let (
+        (current-position (get-user-position tx-sender))
+        (new-collateral (+ (get collateral-deposited current-position) amount))
+        (current-debt (get amount-borrowed current-position))
+    )
+    
+    ;; Validation checks
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= amount (stx-get-balance tx-sender)) ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Execute collateral transfer
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update protocol state
+    (var-set total-protocol-deposits (+ (var-get total-protocol-deposits) amount))
+    
+    ;; Update user position
+    (update-user-position tx-sender new-collateral current-debt true)
+    
+    (ok amount))
+)
+
+;; BORROW AGAINST COLLATERAL  
+;; Users can borrow STX tokens up to their collateralization limit
+;; Borrowing is subject to minimum collateral ratio requirements
+(define-public (borrow-tokens (amount uint))
+    (let (
+        (user-position (get-user-position tx-sender))
+        (current-collateral (get collateral-deposited user-position))
+        (current-debt (get amount-borrowed user-position))
+        (new-total-debt (+ current-debt amount))
+        (resulting-health-ratio (calculate-position-health-ratio current-collateral new-total-debt))
+    )
+    
+    ;; Validation and risk checks
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= resulting-health-ratio (var-get minimum-collateral-ratio)) 
+              ERR_INSUFFICIENT_COLLATERAL)
+    (asserts! (<= amount (as-contract (stx-get-balance tx-sender))) 
+              ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Execute token transfer to borrower
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    
+    ;; Update protocol metrics
+    (var-set total-protocol-borrows (+ (var-get total-protocol-borrows) amount))
+    
+    ;; Update user position
+    (update-user-position tx-sender current-collateral new-total-debt true)
+    
+    (ok amount))
+)
