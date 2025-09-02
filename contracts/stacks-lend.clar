@@ -246,3 +246,129 @@
     
     (ok amount))
 )
+
+;; REPAY BORROWED TOKENS
+;; Users repay their outstanding debt plus accrued interest
+;; Partial and full repayments are supported
+(define-public (repay-debt (amount uint))
+    (let (
+        (user-position (get-user-position tx-sender))
+        (current-collateral (get collateral-deposited user-position))
+        (current-debt (get amount-borrowed user-position))
+        (accrued-interest (get accrued-interest user-position))
+        (total-debt (+ current-debt accrued-interest))
+        (repay-amount (if (<= amount total-debt) amount total-debt))
+        (remaining-debt (- total-debt repay-amount))
+    )
+    
+    ;; Validation
+    (asserts! (> repay-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> total-debt u0) ERR_POSITION_NOT_FOUND)
+    (asserts! (<= repay-amount (stx-get-balance tx-sender)) ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Execute repayment transfer
+    (try! (stx-transfer? repay-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Calculate protocol fee from repayment
+    (let ((protocol-fee (/ (* repay-amount (var-get protocol-fee-bps)) BASIS_POINTS)))
+        (var-set protocol-revenue (+ (var-get protocol-revenue) protocol-fee)))
+    
+    ;; Update protocol metrics
+    (var-set total-protocol-borrows (- (var-get total-protocol-borrows) repay-amount))
+    
+    ;; Update user position
+    (update-user-position tx-sender current-collateral remaining-debt false)
+    
+    (ok repay-amount))
+)
+
+;; WITHDRAW COLLATERAL
+;; Users can withdraw excess collateral while maintaining minimum ratios
+;; Protects protocol by enforcing collateralization requirements
+(define-public (withdraw-collateral (amount uint))
+    (let (
+        (user-position (get-user-position tx-sender))
+        (current-collateral (get collateral-deposited user-position))
+        (current-debt (get amount-borrowed user-position))
+        (remaining-collateral (- current-collateral amount))
+        (resulting-health-ratio (if (> current-debt u0)
+            (calculate-position-health-ratio remaining-collateral current-debt)
+            u0))
+    )
+    
+    ;; Validation and safety checks
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= amount current-collateral) ERR_INSUFFICIENT_COLLATERAL)
+    
+    ;; If user has debt, ensure withdrawal maintains minimum collateral ratio
+    (if (> current-debt u0)
+        (asserts! (>= resulting-health-ratio (var-get minimum-collateral-ratio))
+                  ERR_INSUFFICIENT_COLLATERAL)
+        true)
+    
+    ;; Execute collateral withdrawal
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    
+    ;; Update protocol state
+    (var-set total-protocol-deposits (- (var-get total-protocol-deposits) amount))
+    
+    ;; Update user position
+    (update-user-position tx-sender remaining-collateral current-debt true)
+    
+    (ok amount))
+)
+
+;; LIQUIDATE UNHEALTHY POSITION
+;; Liquidators can seize collateral from positions below liquidation threshold
+;; Protects protocol solvency and provides liquidation incentives
+(define-public (liquidate-position (target-user principal))
+    (let (
+        (target-position (unwrap! (map-get? user-lending-positions { user: target-user }) 
+                                  ERR_POSITION_NOT_FOUND))
+        (collateral (get collateral-deposited target-position))
+        (debt (+ (get amount-borrowed target-position) (get accrued-interest target-position)))
+        (liquidation-calc (calculate-liquidation-amounts collateral debt))
+    )
+    
+    ;; Security and eligibility checks
+    (asserts! (not (is-eq target-user tx-sender)) ERR_SELF_LIQUIDATION_PROHIBITED)
+    (asserts! (> debt u0) ERR_POSITION_NOT_FOUND)
+    (asserts! (is-position-liquidatable collateral debt) ERR_LIQUIDATION_CONDITIONS_NOT_MET)
+    
+    ;; Execute liquidation transfers
+    (try! (as-contract (stx-transfer? (get liquidator-reward liquidation-calc) 
+                                     tx-sender tx-sender)))
+    
+    ;; Update protocol revenue with liquidation fees
+    (var-set protocol-revenue (+ (var-get protocol-revenue) 
+                                (get protocol-reward liquidation-calc)))
+    
+    ;; Update global protocol metrics
+    (var-set total-protocol-deposits (- (var-get total-protocol-deposits) collateral))
+    (var-set total-protocol-borrows (- (var-get total-protocol-borrows) debt))
+    
+    ;; Clear liquidated position
+    (map-delete user-lending-positions { user: target-user })
+    
+    ;; Record liquidation event for analytics
+    ;; (liquidation history logging would be implemented here)
+    
+    (ok { liquidated-debt: debt, seized-collateral: collateral }))
+)
+
+;; PROTOCOL ANALYTICS & READ-ONLY FUNCTIONS
+
+;; Get comprehensive user position data
+(define-read-only (get-user-position (user principal))
+    (default-to
+        {
+            collateral-deposited: u0,
+            amount-borrowed: u0,
+            interest-rate-bps: (var-get base-interest-rate),
+            last-interaction-height: u0,
+            accrued-interest: u0,
+            position-health-score: u0
+        }
+        (map-get? user-lending-positions { user: user })
+    )
+)
